@@ -1,18 +1,19 @@
-from flask import Flask, render_template, render_template_string, request, jsonify, send_file
-import yfinance as yf
+import requests
 import pandas as pd
-from ta.momentum import RSIIndicator
 from datetime import datetime
 import io
-import requests
-from bs4 import BeautifulSoup
-import random  # For dummy data simulation
-from prophet import Prophet  # For AI predictions
-import os  # For environment variables
+import random
+from prophet import Prophet
+import os
 import time
 from functools import lru_cache
+import logging
 
 app = Flask(__name__)
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 portfolio = {}
 user_scores = {}  # For gamification
@@ -25,46 +26,83 @@ eco_scores = {
 @lru_cache(maxsize=128)  # Cache results to avoid repeated API calls
 def get_stock_data(ticker):
     try:
-        # Add a 1-second delay to respect Yahoo's rate limits
+        # Add a 1-second delay to respect API rate limits
         time.sleep(1)
-        stock = yf.Ticker(ticker)
-        info = stock.info
-        history = stock.history(period="30d")
-        current_price = info.get('regularMarketPrice', history['Close'][-1])
-        sma_20 = history['Close'].rolling(window=20).mean().iloc[-1]
-        rsi = RSIIndicator(history['Close'], window=14).rsi().iloc[-1]
-        chart_data = history['Close'].tail(30).to_list()
+        logger.info(f"Fetching data for ticker: {ticker}")
+        api_key = "your_fmp_api_key"  # Replace with your FMP API key from financialmodelingprep.com
+        base_url = "https://financialmodelingprep.com/api/v3"
+
+        # Get quote (real-time price)
+        quote_url = f"{base_url}/quote/{ticker}?apikey={api_key}"
+        quote_response = requests.get(quote_url, timeout=10)
+        quote_response.raise_for_status()
+        quote_data = quote_response.json()[0]
+        current_price = quote_data.get('price', 0)
+
+        # Get historical data (30 days)
+        history_url = f"{base_url}/historical-price-full/{ticker}?from={datetime.now().date() - pd.Timedelta(days=30)}&to={datetime.now().date()}&apikey={api_key}"
+        history_response = requests.get(history_url, timeout=10)
+        history_response.raise_for_status()
+        history_data = history_response.json()['historical']
+        history_df = pd.DataFrame(history_data)
+        if history_df.empty or 'close' not in history_df:
+            raise ValueError(f"No historical data available for ticker: {ticker}")
         
-        # AI Prediction (simulated)
-        df = pd.DataFrame({"ds": history.index, "y": history["Close"]})
+        history_df['date'] = pd.to_datetime(history_df['date'])
+        history_df = history_df.sort_values('date')
+        close_prices = history_df['close'].tail(30).tolist()
+        sma_20 = history_df['close'].rolling(window=20).mean().iloc[-1]
+        rsi = calculate_rsi(history_df['close'].tail(14).tolist())  # Simplified RSI calculation
+
+        # AI Prediction (simulated with Prophet)
+        df = pd.DataFrame({"ds": history_df['date'], "y": history_df["close"]})
         model = Prophet(yearly_seasonality=True)
         model.fit(df)
         future = model.make_future_dataframe(periods=7)  # 7-day forecast
         forecast = model.predict(future)
         prediction = round(forecast["yhat"].iloc[-1], 2)
-        
+
+        logger.info(f"Successfully fetched data for ticker: {ticker}")
         return {
-            "name": info.get('longName', ticker),
+            "name": quote_data.get('name', ticker),
             "price": round(current_price, 2),
-            "sma_20": round(sma_20, 2),
-            "rsi": round(rsi, 2),
+            "sma_20": round(sma_20, 2) if not pd.isna(sma_20) else 0,
+            "rsi": round(rsi, 2) if rsi is not None else 0,
             "decision": "Buy" if current_price < sma_20 else "Sell" if current_price > sma_20 else "Hold",
-            "volume": info.get('volume', 0),
-            "change": round(((current_price - history['Close'].iloc[-2]) / history['Close'].iloc[-2]) * 100, 2),
-            "chart_data": chart_data,
+            "volume": quote_data.get('volume', 0),
+            "change": round(((current_price - history_df['close'].iloc[-2]) / history_df['close'].iloc[-2]) * 100, 2) if len(history_df['close']) > 1 else 0,
+            "chart_data": close_prices,
             "prediction": prediction,
             "eco_score": eco_scores.get(ticker, {"score": 50, "carbon": 5000})
         }
     except Exception as e:
+        logger.error(f"Error fetching data for {ticker}: {str(e)}")
         return None
 
+def calculate_rsi(prices):
+    if len(prices) < 14:
+        return None
+    deltas = [prices[i+1] - prices[i] for i in range(len(prices)-1)]
+    gains = [d if d > 0 else 0 for d in deltas]
+    losses = [-d if d < 0 else 0 for d in deltas]
+    avg_gain = sum(gains[:14]) / 14
+    avg_loss = sum(losses[:14]) / 14
+    if avg_loss == 0:
+        return 100
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
 def get_stock_news(ticker):
-    url = f"https://www.google.com/search?q={ticker}+stock+news&tbm=nws"
-    headers = {"User-Agent": "Mozilla/5.0"}
-    response = requests.get(url, headers=headers)
-    soup = BeautifulSoup(response.text, 'html.parser')
-    news_items = soup.select("div.BNeawe a")[:3]
-    return [{"title": item.text, "link": item['href']} for item in news_items]
+    try:
+        api_key = "your_fmp_api_key"  # Replace with your FMP API key
+        news_url = f"https://financialmodelingprep.com/api/v4/stock_news?ticker={ticker}&limit=3&apikey={api_key}"
+        response = requests.get(news_url, timeout=10)
+        response.raise_for_status()
+        news_data = response.json()
+        return [{"title": item['title'], "link": item['url']} for item in news_data]
+    except Exception as e:
+        logger.error(f"Error fetching news for {ticker}: {str(e)}")
+        return []
 
 def get_financial_tips(user_data=None):
     tips = [
@@ -85,7 +123,7 @@ def home():
         else:
             error = f"Invalid ticker: {ticker}"
     
-    news = {ticker: get_stock_news(ticker) for ticker in portfolio.keys()}
+    news = {ticker: get_stock_news(ticker) for ticker in portfolio.keys() if get_stock_data(ticker)}
     ai_tip = get_financial_tips()
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     
